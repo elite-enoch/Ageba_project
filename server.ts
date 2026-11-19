@@ -30,6 +30,18 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
+function getApiErrorStatus(err: unknown): number {
+  if (err && typeof err === "object" && "status" in err) {
+    const s = Number((err as { status?: unknown }).status);
+    if (s >= 400 && s < 600) return s;
+  }
+  if (err instanceof Error) {
+    if (err.message.includes("429") || err.message.includes("RESOURCE_EXHAUSTED")) return 429;
+    if (err.message.includes("403") || err.message.includes("PERMISSION_DENIED")) return 403;
+  }
+  return 500;
+}
+
 function formatApiError(err: unknown): string {
   if (err instanceof Error) {
     const msg = err.message || "Unexpected server error";
@@ -37,12 +49,16 @@ function formatApiError(err: unknown): string {
       return "API key permission error. Please verify your Gemini API key in Settings > Secrets.";
     }
     if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
-      return "Rate limit or quota reached. Please wait a moment and try again.";
+      return "Free-tier daily quota reached for this Gemini model. Select a billing-enabled API key in Settings > Secrets to increase your quota.";
     }
     return msg;
   }
   return "Unexpected server error";
 }
+
+// In-memory cache for repeated TTS previews and replays (reduces quota usage)
+const ttsCache = new Map<string, string>();
+const MAX_TTS_CACHE = 80;
 
 interface ChatTurn {
   role: "user" | "model";
@@ -93,8 +109,13 @@ async function startServer() {
 
       res.json({ transcript: (response.text ?? "").trim() });
     } catch (err) {
-      console.error("Transcription error:", err);
-      res.status(500).json({ error: formatApiError(err) });
+      const status = getApiErrorStatus(err);
+      if (status === 429) {
+        console.warn("Transcription quota exceeded (429)");
+      } else {
+        console.error("Transcription error:", err);
+      }
+      res.status(status).json({ error: formatApiError(err) });
     }
   });
 
@@ -137,7 +158,7 @@ async function startServer() {
         config: {
           systemInstruction:
             systemInstruction ||
-            "You are Sonance, a warm, articulate, and concise conversational voice assistant. Speak naturally in clear sentences suited for spoken audio playback, avoiding markdown tables or dense formatting unless requested.",
+            "You are elite, a warm, articulate, and concise conversational voice assistant. Speak naturally in clear sentences suited for spoken audio playback, avoiding markdown tables or dense formatting unless requested.",
         },
       });
 
@@ -171,13 +192,27 @@ async function startServer() {
       }
 
       const safeVoice = VALID_VOICES.has(voiceName) ? voiceName : "Zephyr";
+      const cleanText = text.trim();
+      const cleanStyle = style?.trim() || "";
+      const cacheKey = `${safeVoice}::${cleanStyle}::${cleanText}`;
+
+      const cached = ttsCache.get(cacheKey);
+      if (cached) {
+        res.json({
+          audioBase64: cached,
+          mimeType: "audio/wav",
+          cached: true,
+        });
+        return;
+      }
+
       const ai = getGeminiClient();
 
       const part: { text: string; speechMetadata?: { style: string } } = {
-        text: text.trim(),
+        text: cleanText,
       };
-      if (style && style.trim()) {
-        part.speechMetadata = { style: style.trim() };
+      if (cleanStyle) {
+        part.speechMetadata = { style: cleanStyle };
       }
 
       const response = await ai.models.generateContent({
@@ -206,13 +241,29 @@ async function startServer() {
         return;
       }
 
+      if (ttsCache.size >= MAX_TTS_CACHE) {
+        const firstKey = ttsCache.keys().next().value;
+        if (firstKey) ttsCache.delete(firstKey);
+      }
+      ttsCache.set(cacheKey, base64Audio);
+
       res.json({
         audioBase64: base64Audio,
         mimeType: "audio/wav",
       });
     } catch (err) {
+      const status = getApiErrorStatus(err);
+      if (status === 429) {
+        console.warn("TTS quota exceeded (429) for gemini-3.8-flash-lite-tts");
+        res.status(429).json({
+          code: "QUOTA_EXCEEDED",
+          error:
+            "Gemini TTS free-tier daily quota reached (10 requests/day). Select a billing-enabled API key in Settings > Secrets for higher limits.",
+        });
+        return;
+      }
       console.error("TTS error:", err);
-      res.status(500).json({ error: formatApiError(err) });
+      res.status(status).json({ error: formatApiError(err) });
     }
   });
 
@@ -275,7 +326,7 @@ async function startServer() {
               },
               systemInstruction:
                 msg.systemInstruction ||
-                "You are Sonance, an attentive, conversational AI voice assistant. Keep spoken replies crisp, natural, and directly helpful.",
+                "You are elite, an attentive, conversational AI voice assistant. Keep spoken replies crisp, natural, and directly helpful.",
             },
             callbacks: {
               onmessage: (message: LiveServerMessage) => {
@@ -396,7 +447,7 @@ async function startServer() {
   }
 
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Sonance server listening on http://0.0.0.0:${PORT}`);
+    console.log(`elite server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

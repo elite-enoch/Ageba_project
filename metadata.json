@@ -1,5 +1,5 @@
 {
-  "name": "Sonance",
+  "name": "elite",
   "description": "Real-time AI voice assistant for spoken conversations with live speech recognition, natural language processing, and audio waveform playback.",
   "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

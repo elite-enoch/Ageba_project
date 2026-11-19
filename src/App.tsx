@@ -140,6 +140,7 @@ export default function App() {
   const [liveTranscript, setLiveTranscript] = useState("");
   const [textInput, setTextInput] = useState("");
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [ttsQuotaExhausted, setTtsQuotaExhausted] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [synthesizingMsgId, setSynthesizingMsgId] = useState<string | null>(
     null
@@ -159,6 +160,7 @@ export default function App() {
   const activeSessionIdRef = useRef(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
 
+  const ttsCacheRef = useRef<Map<string, string>>(new Map());
   const liveUserTurnIdRef = useRef<string | null>(null);
   const liveAssistantTurnIdRef = useRef<string | null>(null);
   const liveUserTextRef = useRef<string>("");
@@ -261,6 +263,53 @@ export default function App() {
     [updateSession]
   );
 
+  const fetchTtsAudio = useCallback(
+    async (
+      text: string,
+      voiceName: VoiceName,
+      style?: string
+    ): Promise<{ audioBase64?: string; quotaExceeded?: boolean }> => {
+      const cleanText = text.trim();
+      const cacheKey = `${voiceName}::${style || ""}::${cleanText}`;
+      const cached = ttsCacheRef.current.get(cacheKey);
+      if (cached) {
+        return { audioBase64: cached };
+      }
+
+      if (ttsQuotaExhausted) {
+        return { quotaExceeded: true };
+      }
+
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: cleanText,
+          voiceName,
+          style,
+        }),
+      });
+      const data = (await res.json()) as {
+        audioBase64?: string;
+        code?: string;
+        error?: string;
+      };
+
+      if (res.status === 429 || data.code === "QUOTA_EXCEEDED") {
+        setTtsQuotaExhausted(true);
+        return { quotaExceeded: true };
+      }
+
+      if (!res.ok || !data.audioBase64) {
+        throw new Error(data.error || "Speech synthesis failed.");
+      }
+
+      ttsCacheRef.current.set(cacheKey, data.audioBase64);
+      return { audioBase64: data.audioBase64 };
+    },
+    [ttsQuotaExhausted]
+  );
+
   const handlePlayMessageAudio = useCallback(
     async (msg: ConversationMessage) => {
       setErrorBanner(null);
@@ -292,40 +341,39 @@ export default function App() {
         const preset = ASSISTANT_PRESETS.find(
           (p) => p.id === activeSession.presetId
         );
-        const res = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: msg.text,
-            voiceName: msg.voiceName || activeSession.voiceName,
-            style: preset?.ttsStyle,
-          }),
-        });
-        const data = (await res.json()) as {
-          audioBase64?: string;
-          mimeType?: string;
-          error?: string;
-        };
-        if (!res.ok || !data.audioBase64) {
-          throw new Error(data.error || "Speech synthesis failed.");
+        const result = await fetchTtsAudio(
+          msg.text,
+          msg.voiceName || activeSession.voiceName,
+          preset?.ttsStyle
+        );
+
+        if (result.quotaExceeded) {
+          const ok = engine.speakBrowserFallback(msg.text, msg.id, setPlayback);
+          if (!ok) {
+            setErrorBanner(
+              "Gemini TTS daily quota reached (10/day) and browser speech is unavailable."
+            );
+          }
+          return;
         }
 
-        const durationSec = estimateWavDurationSec(data.audioBase64);
-        updateSession(activeSession.id, (s) => ({
-          ...s,
-          messages: s.messages.map((m) =>
-            m.id === msg.id
-              ? {
-                  ...m,
-                  audioBase64: data.audioBase64,
-                  audioMimeType: data.mimeType || "audio/wav",
-                  durationSec,
-                }
-              : m
-          ),
-        }));
-
-        await engine.playWav(data.audioBase64, msg.id, setPlayback);
+        if (result.audioBase64) {
+          const durationSec = estimateWavDurationSec(result.audioBase64);
+          updateSession(activeSession.id, (s) => ({
+            ...s,
+            messages: s.messages.map((m) =>
+              m.id === msg.id
+                ? {
+                    ...m,
+                    audioBase64: result.audioBase64,
+                    audioMimeType: "audio/wav",
+                    durationSec,
+                  }
+                : m
+            ),
+          }));
+          await engine.playWav(result.audioBase64, msg.id, setPlayback);
+        }
       } catch (err) {
         setErrorBanner(
           err instanceof Error ? err.message : "Speech synthesis failed."
@@ -334,7 +382,14 @@ export default function App() {
         setSynthesizingMsgId(null);
       }
     },
-    [activeSession, engine, playback.isPlaying, playback.messageId, updateSession]
+    [
+      activeSession,
+      engine,
+      fetchTtsAudio,
+      playback.isPlaying,
+      playback.messageId,
+      updateSession,
+    ]
   );
 
   // Send a user turn via streaming NLP (/api/chat/stream) + optional TTS (/api/tts)
@@ -422,23 +477,24 @@ export default function App() {
           const preset = ASSISTANT_PRESETS.find(
             (p) => p.id === activeSession.presetId
           );
-          const ttsRes = await fetch("/api/tts", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              text: accumulatedText,
-              voiceName,
-              style: preset?.ttsStyle,
-            }),
-          });
-          const ttsData = (await ttsRes.json()) as {
-            audioBase64?: string;
-            mimeType?: string;
-            error?: string;
-          };
+          const result = await fetchTtsAudio(
+            accumulatedText,
+            voiceName,
+            preset?.ttsStyle
+          );
 
-          if (ttsRes.ok && ttsData.audioBase64) {
-            const durationSec = estimateWavDurationSec(ttsData.audioBase64);
+          if (result.quotaExceeded) {
+            setAudioState("idle");
+            engine.speakBrowserFallback(
+              accumulatedText,
+              assistantMsgId,
+              setPlayback
+            );
+            return;
+          }
+
+          if (result.audioBase64) {
+            const durationSec = estimateWavDurationSec(result.audioBase64);
             upsertMessage(sessionId, {
               id: assistantMsgId,
               role: "assistant",
@@ -446,12 +502,12 @@ export default function App() {
               timestamp: Date.now(),
               inputMode: "voice",
               voiceName,
-              audioBase64: ttsData.audioBase64,
-              audioMimeType: ttsData.mimeType || "audio/wav",
+              audioBase64: result.audioBase64,
+              audioMimeType: "audio/wav",
               durationSec,
             });
             setAudioState("idle");
-            await engine.playWav(ttsData.audioBase64, assistantMsgId, setPlayback);
+            await engine.playWav(result.audioBase64, assistantMsgId, setPlayback);
             return;
           }
         }
@@ -463,7 +519,7 @@ export default function App() {
         setAudioState((prev) => (prev === "processing" ? "idle" : prev));
       }
     },
-    [activeSession, autoSpeakReplies, engine, upsertMessage]
+    [activeSession, autoSpeakReplies, engine, fetchTtsAudio, upsertMessage]
   );
 
   // Stop Live Duplex Session
@@ -846,22 +902,22 @@ export default function App() {
     setErrorBanner(null);
 
     try {
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: opt.sampleLine,
-          voiceName: voice,
-        }),
-      });
-      const data = (await res.json()) as {
-        audioBase64?: string;
-        error?: string;
-      };
-      if (!res.ok || !data.audioBase64) {
-        throw new Error(data.error || "Voice preview failed.");
+      const result = await fetchTtsAudio(opt.sampleLine, voice);
+      if (result.quotaExceeded) {
+        engine.speakBrowserFallback(
+          opt.sampleLine,
+          `preview-${voice}`,
+          setPlayback
+        );
+        return;
       }
-      await engine.playWav(data.audioBase64, `preview-${voice}`, setPlayback);
+      if (result.audioBase64) {
+        await engine.playWav(
+          result.audioBase64,
+          `preview-${voice}`,
+          setPlayback
+        );
+      }
     } catch (err) {
       setErrorBanner(
         err instanceof Error ? err.message : "Unable to preview voice."
@@ -905,7 +961,7 @@ export default function App() {
           }}
           className="font-display text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
         >
-          Sonance
+          elite
         </a>
 
         {/* Zone 2: Concise single-line navigation links */}
@@ -950,6 +1006,41 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* Gemini TTS Free-Tier Quota Notice */}
+      {ttsQuotaExhausted && (
+        <div
+          role="status"
+          className="bg-amber-50 border-b border-amber-200 px-6 py-2 flex flex-wrap items-center justify-between gap-3 text-xs text-amber-900 shrink-0"
+        >
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              Gemini TTS free-tier daily quota reached (10 requests/day) — using
+              browser speech for text playback. Use{" "}
+              <strong>Start Live Voice</strong> or select a billing-enabled API
+              key in <strong>Settings &gt; Secrets</strong> for higher limits.
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setTtsQuotaExhausted(false)}
+              className="px-2.5 py-1 font-medium text-amber-900 bg-amber-100 hover:bg-amber-200 rounded transition-colors cursor-pointer whitespace-nowrap"
+            >
+              Retry Gemini TTS
+            </button>
+            <button
+              type="button"
+              onClick={() => setTtsQuotaExhausted(false)}
+              aria-label="Dismiss notice"
+              className="p-1 text-amber-700 hover:text-amber-900 rounded cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Non-blocking Error Banner */}
       {errorBanner && (
@@ -1328,7 +1419,7 @@ export default function App() {
                                   isUser ? "text-slate-900" : "text-blue-700"
                                 }`}
                               >
-                                {isUser ? "You" : "Sonance"}
+                                {isUser ? "You" : "elite"}
                               </span>
                               <span aria-hidden="true">·</span>
                               <span className="font-mono tabular-nums">

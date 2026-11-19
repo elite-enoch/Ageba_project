@@ -67,6 +67,13 @@ export class VoiceAudioEngine {
   private onLiveEndedCb: (() => void) | null = null;
   private liveIdleTimer: number | null = null;
 
+  // Browser speechSynthesis fallback state (when Gemini TTS quota is reached)
+  private browserSpeechId: string | null = null;
+  private browserSpeechPlaying = false;
+  private browserSpeechTimer: number | null = null;
+  private browserSpeechStartMs = 0;
+  private browserSpeechEstDur = 0;
+
   private emptyTimeDomain = new Uint8Array(512).fill(128);
   private emptyFrequency = new Uint8Array(512).fill(0);
 
@@ -438,7 +445,115 @@ export class VoiceAudioEngine {
     this.progressRaf = requestAnimationFrame(this.tickProgress);
   };
 
+  public speakBrowserFallback(
+    text: string,
+    messageId: string,
+    onProgress: (p: PlaybackProgress) => void
+  ): boolean {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return false;
+    }
+
+    this.stopWav();
+    this.stopLivePlayback();
+
+    const words = text.trim().split(/\s+/).filter(Boolean).length;
+    const estDuration = Math.max(1.5, words / 2.6);
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+
+    const voices = window.speechSynthesis.getVoices();
+    const preferred =
+      voices.find((v) => v.lang.startsWith("en") && v.localService) ||
+      voices.find((v) => v.lang.startsWith("en"));
+    if (preferred) {
+      utterance.voice = preferred;
+    }
+
+    this.browserSpeechId = messageId;
+    this.browserSpeechPlaying = true;
+    this.browserSpeechStartMs = performance.now();
+    this.browserSpeechEstDur = estDuration;
+    this.onProgressCb = onProgress;
+
+    const clearTimer = () => {
+      if (this.browserSpeechTimer) {
+        window.clearInterval(this.browserSpeechTimer);
+        this.browserSpeechTimer = null;
+      }
+    };
+
+    utterance.onend = () => {
+      clearTimer();
+      this.browserSpeechPlaying = false;
+      this.browserSpeechId = null;
+      onProgress({
+        messageId: null,
+        currentTime: 0,
+        duration: estDuration,
+        isPlaying: false,
+      });
+    };
+
+    utterance.onerror = () => {
+      clearTimer();
+      this.browserSpeechPlaying = false;
+      this.browserSpeechId = null;
+      onProgress({
+        messageId: null,
+        currentTime: 0,
+        duration: 0,
+        isPlaying: false,
+      });
+    };
+
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+
+    onProgress({
+      messageId,
+      currentTime: 0,
+      duration: estDuration,
+      isPlaying: true,
+    });
+
+    this.browserSpeechTimer = window.setInterval(() => {
+      if (!this.browserSpeechPlaying || this.browserSpeechId !== messageId) {
+        clearTimer();
+        return;
+      }
+      const elapsed = Math.min(
+        estDuration,
+        (performance.now() - this.browserSpeechStartMs) / 1000
+      );
+      onProgress({
+        messageId,
+        currentTime: elapsed,
+        duration: estDuration,
+        isPlaying: true,
+      });
+    }, 120);
+
+    return true;
+  }
+
   public pauseWav(): void {
+    if (this.browserSpeechPlaying && typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.pause();
+      this.browserSpeechPlaying = false;
+      if (this.onProgressCb && this.browserSpeechId) {
+        this.onProgressCb({
+          messageId: this.browserSpeechId,
+          currentTime: (performance.now() - this.browserSpeechStartMs) / 1000,
+          duration: this.browserSpeechEstDur,
+          isPlaying: false,
+        });
+      }
+      return;
+    }
+
     if (!this.wavPlaying || !this.wavSource || !this.outputCtx) return;
     this.wavOffset = Math.min(
       this.wavBuffer?.duration ?? 0,
@@ -468,11 +583,42 @@ export class VoiceAudioEngine {
   }
 
   public resumeWav(): void {
+    if (this.browserSpeechId && !this.browserSpeechPlaying && typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.resume();
+      this.browserSpeechPlaying = true;
+      if (this.onProgressCb) {
+        this.onProgressCb({
+          messageId: this.browserSpeechId,
+          currentTime: (performance.now() - this.browserSpeechStartMs) / 1000,
+          duration: this.browserSpeechEstDur,
+          isPlaying: true,
+        });
+      }
+      return;
+    }
     if (this.wavPlaying || !this.wavBuffer) return;
     this.startWavSourceFromOffset(this.wavOffset);
   }
 
   public stopWav(): void {
+    if (this.browserSpeechTimer) {
+      window.clearInterval(this.browserSpeechTimer);
+      this.browserSpeechTimer = null;
+    }
+    if (this.browserSpeechId && typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+      this.browserSpeechPlaying = false;
+      this.browserSpeechId = null;
+      if (this.onProgressCb) {
+        this.onProgressCb({
+          messageId: null,
+          currentTime: 0,
+          duration: 0,
+          isPlaying: false,
+        });
+      }
+    }
+
     this.wavPlaying = false;
     if (this.progressRaf) {
       cancelAnimationFrame(this.progressRaf);
@@ -503,6 +649,15 @@ export class VoiceAudioEngine {
   }
 
   public getSnapshot(preferSource: "mic" | "playback" | "auto"): AnalysisSnapshot {
+    if (this.browserSpeechPlaying) {
+      return {
+        timeDomain: this.emptyTimeDomain,
+        frequency: this.emptyFrequency,
+        rmsDb: -22,
+        hasSignal: false,
+      };
+    }
+
     let analyser: AnalyserNode | null = null;
     if (preferSource === "mic") {
       analyser = this.inputAnalyser;

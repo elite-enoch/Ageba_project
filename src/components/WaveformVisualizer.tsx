@@ -95,7 +95,8 @@ export const WaveformVisualizer: React.FC<WaveformVisualizerProps> = ({
 
       if (now - lastDbUpdateRef.current > 90) {
         lastDbUpdateRef.current = now;
-        const db = snap.hasSignal ? snap.rmsDb : -60;
+        const db =
+          snap.hasSignal || effectiveState === "speaking" ? snap.rmsDb : -60;
         setRmsDbDisplay(`${db.toFixed(1)} dB`);
       }
 
@@ -136,6 +137,13 @@ export const WaveformVisualizer: React.FC<WaveformVisualizerProps> = ({
             Math.floor((i / barCount) * (freqLen * 0.45))
           );
           magnitude = snap.frequency[binIndex] / 255;
+        } else if (effectiveState === "speaking" && !prefersReducedMotion) {
+          const centerEnv = Math.sin((i / barCount) * Math.PI);
+          magnitude =
+            (0.22 +
+              0.25 * Math.abs(Math.sin(phase * 2.4 + i * 0.35)) *
+                Math.abs(Math.cos(phase * 1.1 + i * 0.15))) *
+            (0.35 + 0.65 * centerEnv);
         } else if (
           (effectiveState === "processing" || effectiveState === "connecting") &&
           !prefersReducedMotion
@@ -177,6 +185,14 @@ export const WaveformVisualizer: React.FC<WaveformVisualizerProps> = ({
         ) {
           const norm = (samples[i] - 128) / 128;
           yOffset = norm * (h * 0.42);
+        } else if (effectiveState === "speaking" && !prefersReducedMotion) {
+          const t = i / sampleCount;
+          const envelope = Math.sin(t * Math.PI);
+          yOffset =
+            (Math.sin(t * Math.PI * 10 + phase * 3.4) * 0.65 +
+              Math.sin(t * Math.PI * 17 - phase * 2.1) * 0.35) *
+            (h * 0.24) *
+            envelope;
         } else if (
           (effectiveState === "processing" || effectiveState === "connecting") &&
           !prefersReducedMotion

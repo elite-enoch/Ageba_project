@@ -36,7 +36,7 @@ export const TranscriptsView: React.FC<TranscriptsViewProps> = ({
       `Voice: ${session.voiceName} · Updated: ${new Date(session.updatedAt).toLocaleString()}`,
       "",
       ...session.messages.map((m) => {
-        const speaker = m.role === "user" ? "You" : "Sonance";
+        const speaker = m.role === "user" ? "You" : "elite";
         return `**${speaker}** (${formatTime(m.timestamp)}):\n${m.text}\n`;
       }),
     ];

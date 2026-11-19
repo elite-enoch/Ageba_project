@@ -175,7 +175,7 @@ export const VoiceStudioView: React.FC<VoiceStudioViewProps> = ({
             rows={4}
             value={customSystemInstruction}
             onChange={(e) => onChangeSystemInstruction(e.target.value)}
-            placeholder="Describe how Sonance should listen, reason, and respond..."
+            placeholder="Describe how elite should listen, reason, and respond..."
             className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
           />
         </div>
